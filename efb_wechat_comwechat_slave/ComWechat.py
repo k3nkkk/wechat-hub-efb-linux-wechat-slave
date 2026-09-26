@@ -89,6 +89,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "media_retry_deadline_sec": 300.0,
     "media_retry_base_sec": 1.0,
     "media_retry_max_sec": 30.0,
+    # React on the Telegram message once Core reports the outcome of a send
+    # made from Telegram. Per-kind switches; an empty emoji disables that
+    # outcome. Only Telegram's standard reaction emoji are accepted.
+    "send_reactions": {
+        "text": False,
+        "image": False,
+        "file": False,
+        "sent": "👌",
+        "uncertain": "🤔",
+        "failed": "👎",
+    },
     # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
     "shutdown_master_budget_sec": 1.0,
     "shutdown_slave_drain_budget_sec": 0.75,
@@ -169,6 +180,18 @@ class LinuxWeChatChannel(SlaveChannel):
             self.media_retry_base_sec,
             float(self.config.get("media_retry_max_sec", 30.0)),
         )
+        reactions = dict(DEFAULT_CONFIG["send_reactions"])
+        if isinstance(self.config.get("send_reactions"), Mapping):
+            reactions.update(self.config["send_reactions"])
+        self.send_reaction_kinds = {
+            kind for kind in ("text", "image", "file") if bool(reactions.get(kind))
+        }
+        self.send_reaction_emoji = {
+            status: str(reactions.get(status) or "").strip()
+            for status in ("sent", "uncertain", "failed")
+        }
+        self._pending_reactions: Dict[str, Dict[str, Any]] = {}
+        self._reaction_lock = threading.Lock()
 
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
@@ -1007,6 +1030,93 @@ class LinuxWeChatChannel(SlaveChannel):
                 str(error.get("message") or "upstream response was not received"),
                 dict(details),
             )
+        self._queue_send_reaction(receipt)
+
+    # -- send outcome reactions ------------------------------------------------
+
+    _REACTION_RETRY_SEC = 3.0
+    _REACTION_MAX_ATTEMPTS = 10
+
+    def _queue_send_reaction(self, receipt: Mapping[str, Any]) -> None:
+        """Remember a reaction for the Telegram message behind a Core send."""
+        kind = str(receipt.get("kind") or "")
+        status = str(receipt.get("status") or "")
+        send_id = str(receipt.get("send_id") or "")
+        emoji = self.send_reaction_emoji.get(status, "")
+        if not send_id or not emoji or kind not in self.send_reaction_kinds:
+            return
+        with self._reaction_lock:
+            self._pending_reactions[send_id] = {"emoji": emoji, "attempts": 0, "due": 0.0}
+        self._flush_send_reactions()
+
+    def _flush_send_reactions(self) -> None:
+        if not self._pending_reactions:
+            return
+        now = time.time()
+        with self._reaction_lock:
+            due = [(sid, dict(item)) for sid, item in self._pending_reactions.items() if item["due"] <= now]
+        for send_id, item in due:
+            target = self._telegram_target(send_id)
+            if target is None:
+                attempts = item["attempts"] + 1
+                with self._reaction_lock:
+                    if attempts >= self._REACTION_MAX_ATTEMPTS:
+                        self._pending_reactions.pop(send_id, None)
+                        self.logger.info("No Telegram message found for send %s; reaction dropped", send_id)
+                    elif send_id in self._pending_reactions:
+                        self._pending_reactions[send_id].update(
+                            attempts=attempts, due=now + self._REACTION_RETRY_SEC
+                        )
+                continue
+            with self._reaction_lock:
+                if self._pending_reactions.get(send_id, {}).get("emoji") == item["emoji"]:
+                    self._pending_reactions.pop(send_id, None)
+            self._set_telegram_reaction(target[0], target[1], item["emoji"])
+
+    @staticmethod
+    def _telegram_target(send_id: str) -> Optional[Tuple[str, int]]:
+        """Telegram chat/message of the message that produced ``send_id``.
+
+        The Telegram master logs the slave UID it got back from
+        ``send_message`` (the Core send_id) next to the Telegram message ID.
+        """
+        try:
+            from efb_telegram_master.db import MsgLog  # type: ignore
+        except Exception:
+            return None
+        try:
+            row = (
+                MsgLog.select()
+                .where(MsgLog.slave_message_id == send_id)
+                .order_by(MsgLog.time.desc())
+                .first()
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        chat_id, _, message_id = str(row.master_msg_id).rpartition(".")
+        try:
+            return chat_id, int(message_id)
+        except ValueError:
+            return None
+
+    def _set_telegram_reaction(self, chat_id: str, message_id: int, emoji: str) -> None:
+        master = getattr(coordinator, "master", None)
+        bot = getattr(getattr(master, "bot_manager", None), "_bot", None)
+        if bot is None:
+            return
+        try:
+            bot._post(
+                "setMessageReaction",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reaction": [{"type": "emoji", "emoji": emoji}],
+                },
+            )
+        except Exception as exc:  # reactions are cosmetic; never break polling
+            self.logger.warning("Telegram reaction %s on %s/%s failed: %s", emoji, chat_id, message_id, exc)
 
     @staticmethod
     def _is_media_message(message: Mapping[str, Any]) -> bool:
@@ -1477,6 +1587,7 @@ class LinuxWeChatChannel(SlaveChannel):
             self._ensure_subscription_floor()
         self._retry_pending_media()
         self._retry_deferred_provenance()
+        self._flush_send_reactions()
         cursor = self.cursor_store.load(default=None)
         if cursor is None:
             cursor = self._ensure_bootstrap_aligned()

@@ -11,3 +11,13 @@ consumer_id: efb-linux-wechat
 poll_interval: 1.0
 event_limit: 50
 startup_healthcheck: true
+
+# React on messages you send from Telegram once Core reports the outcome.
+# Per-kind switches; an empty emoji disables that outcome.
+send_reactions:
+  text: false
+  image: false
+  file: false
+  sent: "👌"
+  uncertain: "🤔"
+  failed: "👎"

@@ -37,9 +37,18 @@ consumer_id: efb-linux-wechat
 poll_interval: 1.0
 event_limit: 50
 startup_healthcheck: true
+send_reactions:              # react on your Telegram message after a send
+  text: false
+  image: false
+  file: false
+  sent: "👌"
+  uncertain: "🤔"
+  failed: "👎"
 ```
 
 `account_ids: []` exposes all configured Core accounts. If several independent EFB slave instances are desired, give each instance an explicit non-overlapping account list and its own EFB instance ID.
+
+`send_reactions` confirms messages you send from Telegram. When Core reports the outcome of a send, the bot reacts on your Telegram message: `sent` once WeChat shows the message (echo reconciled), `uncertain` when WeChat did not confirm it in time, `failed` when the send failed. Switch it on per kind (`text`, `image`, `file`); an empty emoji disables that outcome. Only Telegram's standard reaction emoji can be used (for example 👌 👍 🤔 👎; ✅ is not available).
 
 The EFB profile-level `config.yaml` should then select the master/slave modules normally, for example:
 
