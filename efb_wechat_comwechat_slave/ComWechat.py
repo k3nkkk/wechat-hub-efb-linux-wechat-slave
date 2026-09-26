@@ -89,6 +89,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "media_retry_deadline_sec": 300.0,
     "media_retry_base_sec": 1.0,
     "media_retry_max_sec": 30.0,
+    # A send from Telegram can reach WeChat (and come back from Core as an
+    # outgoing message) before Core has linked it to the send. Outgoing
+    # messages in a chat with an unconfirmed send are held for up to this
+    # many seconds so the echo is recognised instead of delivered twice.
+    "send_echo_wait_sec": 20.0,
     # React on the Telegram message once Core reports the outcome of a send
     # made from Telegram. Per-kind switches; an empty emoji disables that
     # outcome. Only Telegram's standard reaction emoji are accepted.
@@ -191,6 +196,8 @@ class LinuxWeChatChannel(SlaveChannel):
             for status in ("sent", "uncertain", "failed")
         }
         self._pending_reactions: Dict[str, Dict[str, Any]] = {}
+        self.send_echo_wait_sec = max(0.0, float(self.config.get("send_echo_wait_sec", 20.0)))
+        self._inflight_sends: Dict[str, Tuple[str, str, float]] = {}
         self._reaction_lock = threading.Lock()
 
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
@@ -898,6 +905,8 @@ class LinuxWeChatChannel(SlaveChannel):
                 self.echo_store.link(send_id, echo_message_id)
             else:
                 self.echo_store.mark_pending(send_id, request_id)
+                with self._reaction_lock:
+                    self._inflight_sends[send_id] = (account_id, chat_id, time.time())
         telegram_chat_id, telegram_message_id = self._telegram_message_ids(msg)
         self.message_mapping.record(
             self.consumer_id,
@@ -1030,7 +1039,79 @@ class LinuxWeChatChannel(SlaveChannel):
                 str(error.get("message") or "upstream response was not received"),
                 dict(details),
             )
+        if send_id and (echo_message_id or status in {"sent", "failed", "uncertain"}):
+            with self._reaction_lock:
+                self._inflight_sends.pop(send_id, None)
         self._queue_send_reaction(receipt)
+
+    # -- send echo hold ---------------------------------------------------------
+
+    def _awaiting_send_echo(self, account_id: str, chat_id: str) -> bool:
+        """Is a send from Telegram to this chat still waiting for its echo link?"""
+        if not self._inflight_sends:
+            return False
+        now = time.time()
+        with self._reaction_lock:
+            for send_id, (acc, chat, started) in list(self._inflight_sends.items()):
+                if now - started > self.send_echo_wait_sec:
+                    self._inflight_sends.pop(send_id, None)
+                elif acc == account_id and chat == chat_id:
+                    return True
+        return False
+
+    def _hold_pending(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        event_type: str,
+        effect_id: str,
+        reason: str,
+    ) -> None:
+        """Park a message durably; the pending-media retry path re-evaluates it."""
+        now = time.time()
+        current = self.effect_ledger.get_effect(self.consumer_id, effect_id)
+        details = current.get("details", {}) if current else {}
+        try:
+            attempt_count = int(details.get("attempt_count") or 1)
+        except (TypeError, ValueError):
+            attempt_count = 1
+        try:
+            deadline_at = float(details.get("deadline_at"))
+        except (TypeError, ValueError):
+            deadline_at = now + self.media_retry_deadline_sec
+        self.effect_ledger.mark_media_pending(
+            self.consumer_id,
+            effect_id,
+            account_id=account_id,
+            message_id=str(message.get("message_id") or ""),
+            event_type=event_type,
+            message=message,
+            media_id=str(message.get("media_id") or ""),
+            attempt_count=attempt_count,
+            next_retry_at=now,
+            deadline_at=deadline_at,
+            last_error=reason,
+        )
+        self.logger.info("Holding effect %s: %s", effect_id, reason)
+
+    def _close_held_echo(
+        self,
+        account_id: str,
+        core_message_id: str,
+        efb_message_id: str,
+        event_type: str,
+    ) -> None:
+        """A held message turned out to be the echo of our own send: close it."""
+        effect_id = self.effect_ledger.compute_effect_id(account_id, core_message_id)
+        if self.effect_ledger.get_effect_status(self.consumer_id, effect_id) != STATE_PENDING_MEDIA:
+            return
+        self.effect_ledger.mark_delivered(
+            self.consumer_id,
+            effect_id,
+            efb_uid=efb_message_id,
+            event_type=event_type,
+            details={"suppressed_send_echo": True},
+        )
 
     # -- send outcome reactions ------------------------------------------------
 
@@ -1258,6 +1339,7 @@ class LinuxWeChatChannel(SlaveChannel):
                 core_message_id,
                 efb_message_id,
             )
+            self._close_held_echo(account_id, core_message_id, efb_message_id, event_type)
             return
 
         is_media = self._is_media_message(message)
@@ -1339,6 +1421,14 @@ class LinuxWeChatChannel(SlaveChannel):
                 event_type,
                 reason=classification_reason,
             )
+            return
+
+        if (
+            effect_id
+            and str(message.get("direction") or "") == "outgoing"
+            and self._awaiting_send_echo(account_id, chat_id)
+        ):
+            self._hold_pending(account_id, message, event_type, effect_id, "waiting for send echo")
             return
 
         chat = self._resolve_core_chat(account_id, chat_id)
