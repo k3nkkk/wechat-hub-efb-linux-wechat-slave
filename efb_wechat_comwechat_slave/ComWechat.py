@@ -95,8 +95,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # it is ready (a text can overtake a still-downloading image). "ordered"
     # holds later messages of the same chat behind pending media, for at most
     # ``ordered_max_wait_sec`` seconds, so the chat keeps its original order.
+    # ``ordered_scope`` picks what is held: "all" (text too) or "media" (only
+    # images/videos/files keep their order; text is forwarded immediately).
     "delivery_mode": "fast",
-    "ordered_max_wait_sec": 60.0,
+    "ordered_scope": "all",
+    "ordered_max_wait_sec": 20.0,
     # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
     "shutdown_master_budget_sec": 1.0,
     "shutdown_slave_drain_budget_sec": 0.75,
@@ -182,7 +185,12 @@ class LinuxWeChatChannel(SlaveChannel):
             self.logger.warning("Unknown delivery_mode %r; using 'fast'", delivery_mode)
             delivery_mode = "fast"
         self.delivery_mode = delivery_mode
-        self.ordered_max_wait_sec = max(0.0, float(self.config.get("ordered_max_wait_sec", 60.0)))
+        ordered_scope = str(self.config.get("ordered_scope") or "all").strip().lower()
+        if ordered_scope not in {"all", "media"}:
+            self.logger.warning("Unknown ordered_scope %r; using 'all'", ordered_scope)
+            ordered_scope = "all"
+        self.ordered_scope = ordered_scope
+        self.ordered_max_wait_sec = max(0.0, float(self.config.get("ordered_max_wait_sec", 20.0)))
 
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
@@ -1418,6 +1426,8 @@ class LinuxWeChatChannel(SlaveChannel):
         became pending, so one slow or lost media never stalls a chat for long.
         """
         if self.delivery_mode != "ordered":
+            return False
+        if self.ordered_scope == "media" and not self._is_media_message(message):
             return False
         key = self._order_key(message)
         now = time.time()

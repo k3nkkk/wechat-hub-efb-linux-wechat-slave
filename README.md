@@ -38,12 +38,13 @@ poll_interval: 1.0
 event_limit: 50
 startup_healthcheck: true
 delivery_mode: fast          # or "ordered"
-ordered_max_wait_sec: 60
+ordered_scope: all         # or "media"
+ordered_max_wait_sec: 20
 ```
 
 `account_ids: []` exposes all configured Core accounts. If several independent EFB slave instances are desired, give each instance an explicit non-overlapping account list and its own EFB instance ID.
 
-`delivery_mode` picks between speed and order within a chat. `fast` (default) forwards each message as soon as it is ready, so a text can arrive before an image or video sent just before it that is still downloading. `ordered` holds later messages of the same chat until the earlier media is delivered, keeping the original order; a pending media blocks the chat for at most `ordered_max_wait_sec` seconds, after which later messages go through and the media follows when ready. Other chats are never held.
+`delivery_mode` picks between speed and order within a chat. `fast` (default) forwards each message as soon as it is ready, so a text can arrive before an image or video sent just before it that is still downloading. `ordered` holds later messages of the same chat until the earlier media is delivered, keeping the original order; a pending media blocks the chat for at most `ordered_max_wait_sec` seconds (default 20), after which later messages go through and the media follows when ready. Other chats are never held. With `ordered_scope: media` only images, videos and files keep their order among themselves and text is forwarded immediately.
 
 The EFB profile-level `config.yaml` should then select the master/slave modules normally, for example:
 

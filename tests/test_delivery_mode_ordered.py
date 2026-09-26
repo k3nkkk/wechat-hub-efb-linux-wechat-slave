@@ -183,6 +183,22 @@ class DeliveryModeTest(unittest.TestCase):
         self._send(text("t1"))
         self.assertEqual(["t1"], self.deliveries)
 
+    def test_media_scope_lets_text_through_but_keeps_media_order(self) -> None:
+        self._channel(delivery_mode="ordered", ordered_scope="media")
+        self._send(image())
+        self._send(text("t1"))
+        # The second media is already downloadable but must wait behind the first.
+        self.core.ready = True
+        self._send(dict(image(), message_id="img-2", media_id="media-chat-1-b"))
+        self.assertEqual(["t1"], self.deliveries)
+        self._media_ready()
+        self.assertEqual(["t1", "img-chat-1", "img-2"], self.deliveries)
+
+    def test_default_max_wait_is_20_seconds(self) -> None:
+        channel = self._channel(delivery_mode="ordered")
+        self.assertEqual("all", channel.ordered_scope)
+        self.assertEqual(20.0, channel.ordered_max_wait_sec)
+
     def test_unknown_mode_falls_back_to_fast(self) -> None:
         self.assertEqual("fast", self._channel(delivery_mode="bogus").delivery_mode)
 

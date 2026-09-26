@@ -15,5 +15,7 @@ startup_healthcheck: true
 # "fast": forward each message as soon as it is ready (text may overtake media).
 # "ordered": hold later messages of a chat behind pending media, keeping order,
 # for at most ordered_max_wait_sec seconds per pending media.
+# ordered_scope: "all" holds text too; "media" orders only images/videos/files.
 delivery_mode: fast
-ordered_max_wait_sec: 60
+ordered_scope: all
+ordered_max_wait_sec: 20
