@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
+from datetime import datetime
 from typing import Any, BinaryIO, Collection, Dict, Mapping, Optional, Set, Tuple
 
 import yaml
@@ -40,6 +41,7 @@ from .Core import CoreAPIError, CoreClient, CoreContractError, CoreError, CoreUn
 from .CoreMessage import CoreMessageBuilder, MediaPendingError, MediaPermanentError
 from .EffectLedger import (
     BLOCKED_UNCERTAIN_EFFECT,
+    DETAIL_RETRY_PARKED,
     DELIVERY_SEMANTICS,
     STATE_DELIVERED,
     STATE_MEDIA_FAILED,
@@ -89,6 +91,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "media_retry_deadline_sec": 300.0,
     "media_retry_base_sec": 1.0,
     "media_retry_max_sec": 30.0,
+    # Delivery ordering within a chat. "fast" delivers every message as soon as
+    # it is ready (a text can overtake a still-downloading image). "ordered"
+    # holds later messages of the same chat behind pending media, for at most
+    # ``ordered_max_wait_sec`` seconds, so the chat keeps its original order.
+    "delivery_mode": "fast",
+    "ordered_max_wait_sec": 60.0,
     # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
     "shutdown_master_budget_sec": 1.0,
     "shutdown_slave_drain_budget_sec": 0.75,
@@ -169,6 +177,12 @@ class LinuxWeChatChannel(SlaveChannel):
             self.media_retry_base_sec,
             float(self.config.get("media_retry_max_sec", 30.0)),
         )
+        delivery_mode = str(self.config.get("delivery_mode") or "fast").strip().lower()
+        if delivery_mode not in {"fast", "ordered"}:
+            self.logger.warning("Unknown delivery_mode %r; using 'fast'", delivery_mode)
+            delivery_mode = "fast"
+        self.delivery_mode = delivery_mode
+        self.ordered_max_wait_sec = max(0.0, float(self.config.get("ordered_max_wait_sec", 60.0)))
 
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
@@ -1231,6 +1245,12 @@ class LinuxWeChatChannel(SlaveChannel):
             )
             return
 
+        if effect_id and self.delivery_mode == "ordered" and current_status == STATE_PENDING_MEDIA:
+            message = self._with_first_cursor(effect_id, message)
+        if effect_id and self._ordered_blocked(account_id, chat_id, message, effect_id):
+            self._hold_for_order(account_id, message, event_type, effect_id)
+            return
+
         chat = self._resolve_core_chat(account_id, chat_id)
         try:
             efb_msg = self.message_builder.build(message, chat)
@@ -1350,6 +1370,114 @@ class LinuxWeChatChannel(SlaveChannel):
             # The event resolved, so it must stop being retried.
             self.provenance_deferrals.resolve(account_id, core_message_id)
 
+    @staticmethod
+    def _order_key(message: Mapping[str, Any]) -> Tuple[float, int]:
+        raw = message.get("created_at")
+        try:
+            created_at = float(raw or 0.0)
+        except (TypeError, ValueError):
+            try:
+                created_at = datetime.fromisoformat(
+                    str(raw).replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                created_at = 0.0
+        try:
+            cursor = int(message.get("_core_cursor") or 0)
+        except (TypeError, ValueError):
+            cursor = 0
+        return created_at, cursor
+
+    def _with_first_cursor(self, effect_id: str, message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Keep the cursor of the first event seen for an effect.
+
+        A later ``message.updated`` (e.g. media became ready) carries a newer
+        cursor; ordering must still use the message's original position.
+        """
+        current = self.effect_ledger.get_effect(self.consumer_id, effect_id)
+        stored = ((current or {}).get("details") or {}).get("message") or {}
+        try:
+            first = int(stored.get("_core_cursor") or 0)
+            now = int(message.get("_core_cursor") or 0)
+        except (TypeError, ValueError):
+            return message
+        if first and (not now or first < now):
+            return dict(message, _core_cursor=str(first))
+        return message
+
+    def _ordered_blocked(
+        self,
+        account_id: str,
+        chat_id: str,
+        message: Mapping[str, Any],
+        effect_id: str,
+    ) -> bool:
+        """In ordered mode, is an earlier message of this chat still pending?
+
+        A pending row only blocks for ``ordered_max_wait_sec`` after it first
+        became pending, so one slow or lost media never stalls a chat for long.
+        """
+        if self.delivery_mode != "ordered":
+            return False
+        key = self._order_key(message)
+        now = time.time()
+        for row in self.effect_ledger.pending_media(self.consumer_id):
+            if str(row.get("effect_id") or "") == effect_id:
+                continue
+            if str(row.get("account_id") or "") != account_id:
+                continue
+            details = row.get("details") or {}
+            if details.get(DETAIL_RETRY_PARKED):
+                continue
+            other = details.get("message")
+            if not isinstance(other, dict) or str(other.get("chat_id") or "") != chat_id:
+                continue
+            if self._order_key(other) >= key:
+                continue
+            try:
+                pending_since = float(details.get("deadline_at")) - self.media_retry_deadline_sec
+            except (TypeError, ValueError):
+                pending_since = now
+            if now - pending_since < self.ordered_max_wait_sec:
+                return True
+        return False
+
+    def _hold_for_order(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        event_type: str,
+        effect_id: str,
+    ) -> None:
+        """Park a ready message durably until the earlier ones are delivered."""
+        now = time.time()
+        current = self.effect_ledger.get_effect(self.consumer_id, effect_id)
+        details = current.get("details", {}) if current else {}
+        try:
+            attempt_count = int(details.get("attempt_count") or 1)
+        except (TypeError, ValueError):
+            attempt_count = 1
+        try:
+            deadline_at = float(details.get("deadline_at"))
+        except (TypeError, ValueError):
+            deadline_at = now + self.media_retry_deadline_sec
+        self.effect_ledger.mark_media_pending(
+            self.consumer_id,
+            effect_id,
+            account_id=account_id,
+            message_id=str(message.get("message_id") or ""),
+            event_type=event_type,
+            message=message,
+            media_id=str(message.get("media_id") or ""),
+            attempt_count=attempt_count,
+            # Due on the next poll tick; it is also re-checked right after the
+            # blocking message within the same retry pass.
+            next_retry_at=now,
+            deadline_at=deadline_at,
+            last_error="held for ordered delivery",
+        )
+        self.logger.info("Holding effect %s for ordered delivery", effect_id)
+
     def _retry_pending_media(
         self,
         *,
@@ -1364,6 +1492,13 @@ class LinuxWeChatChannel(SlaveChannel):
             due_before=None if ready_media else time.time(),
             media_id=media_id,
         )
+        if self.delivery_mode == "ordered":
+            pending = sorted(
+                pending,
+                key=lambda r: self._order_key(
+                    (r.get("details") or {}).get("message") or {}
+                ),
+            )
         attempted = 0
         for row in pending:
             if account_id and str(row.get("account_id") or "") != account_id:
@@ -1397,6 +1532,10 @@ class LinuxWeChatChannel(SlaveChannel):
                 message,
             )
             attempted += 1
+        if ready_media and attempted and self.delivery_mode == "ordered":
+            # Media became ready: release the messages held behind it now
+            # instead of waiting for the next poll tick.
+            attempted += self._retry_pending_media(account_id=account_id)
         return attempted
 
     def _handle_event(self, event: Mapping[str, Any]) -> None:

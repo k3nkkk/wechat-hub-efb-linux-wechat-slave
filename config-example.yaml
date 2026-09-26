@@ -11,3 +11,9 @@ consumer_id: efb-linux-wechat
 poll_interval: 1.0
 event_limit: 50
 startup_healthcheck: true
+
+# "fast": forward each message as soon as it is ready (text may overtake media).
+# "ordered": hold later messages of a chat behind pending media, keeping order,
+# for at most ordered_max_wait_sec seconds per pending media.
+delivery_mode: fast
+ordered_max_wait_sec: 60
