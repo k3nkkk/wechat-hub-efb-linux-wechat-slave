@@ -11,3 +11,6 @@ consumer_id: efb-linux-wechat
 poll_interval: 1.0
 event_limit: 50
 startup_healthcheck: true
+# When an account needs to log in again, post a message with a button that
+# starts the login flow (confirm on the phone, or scan the QR code sent).
+login_alert: true

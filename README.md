@@ -37,7 +37,10 @@ consumer_id: efb-linux-wechat
 poll_interval: 1.0
 event_limit: 50
 startup_healthcheck: true
+login_alert: true            # post a login button when an account logs out
 ```
+
+`login_alert` watches Core `account.status` events. When an account changes to `login_required`, the bot posts a message in a per-account system chat ("<account> · 登录状态") with a **发起登录** button. The button asks Core to start the Runtime login flow: WeChat shows the phone confirmation, or, if a QR login is needed, the QR code is sent to Telegram. When the account is back `online`, a short note follows. The button uses EFB message commands, so it only works while the slave that posted it is running.
 
 `account_ids: []` exposes all configured Core accounts. If several independent EFB slave instances are desired, give each instance an explicit non-overlapping account list and its own EFB instance ID.
 

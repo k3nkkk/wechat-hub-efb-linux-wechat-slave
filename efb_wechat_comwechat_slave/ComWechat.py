@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 import mimetypes
+import tempfile
 import threading
 import time
 import uuid
@@ -23,7 +24,7 @@ import yaml
 from ehforwarderbot import Message, MsgType, Status, coordinator
 from ehforwarderbot import utils as efb_utils
 from ehforwarderbot.channel import SlaveChannel
-from ehforwarderbot.chat import Chat, ChatMember
+from ehforwarderbot.chat import Chat, ChatMember, SystemChatMember
 from ehforwarderbot.exceptions import (
     EFBChatNotFound,
     EFBException,
@@ -31,6 +32,7 @@ from ehforwarderbot.exceptions import (
     EFBMessageTypeNotSupported,
     EFBOperationNotSupported,
 )
+from ehforwarderbot.message import MessageCommand, MessageCommands
 from ehforwarderbot.status import ChatUpdates, MessageRemoval
 from ehforwarderbot.types import ChatID, InstanceID, MessageID
 
@@ -89,6 +91,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "media_retry_deadline_sec": 300.0,
     "media_retry_base_sec": 1.0,
     "media_retry_max_sec": 30.0,
+    # When an account needs to log in again, post a message with a button
+    # that starts the login flow (phone confirmation, or a QR code to scan).
+    "login_alert": True,
+    "login_watch_sec": 120.0,
     # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
     "shutdown_master_budget_sec": 1.0,
     "shutdown_slave_drain_budget_sec": 0.75,
@@ -152,6 +158,11 @@ class LinuxWeChatChannel(SlaveChannel):
         self.chat_mgr = ChatMgr(self)
         self.message_builder = CoreMessageBuilder(self.core, self.chat_mgr)
         self._stop_event = threading.Event()
+        self.login_alert = bool(self.config.get("login_alert", True))
+        self.login_watch_sec = max(10.0, float(self.config.get("login_watch_sec", 120.0)))
+        self._login_lock = threading.Lock()
+        self._account_login_state: Dict[str, str] = {}
+        self._login_watchers: Dict[str, threading.Thread] = {}
         # Retry3 shutdown coordination state.
         self._shutdown_in_progress = threading.Event()
         self._checkpoint_flush_lock = threading.Lock()
@@ -907,6 +918,140 @@ class LinuxWeChatChannel(SlaveChannel):
     def get_message_by_id(self, chat: Chat, msg_id: MessageID) -> Optional[Message]:
         return self._message_cache.get((str(chat.uid), str(msg_id)))
 
+    # -- login alerts ------------------------------------------------------------
+
+    _STATUS_CHAT_ID = "__wechat_hub_login__"
+
+    def _handle_account_status(self, account_id: str, payload: Mapping[str, Any]) -> None:
+        """Post a login button when an account drops out, and a note when it is back."""
+        if not self.login_alert or not account_id:
+            return
+        account = payload.get("account") if isinstance(payload.get("account"), dict) else payload
+        state = str(account.get("state") or "")
+        if not state:
+            return
+        with self._login_lock:
+            previous = self._account_login_state.get(account_id)
+            self._account_login_state[account_id] = state
+        name = str(account.get("display_name") or self.chat_mgr.account_name(account_id))
+        try:
+            if state == "login_required" and previous != "login_required":
+                self._post_login_notice(
+                    account_id,
+                    f"⚠️ 微信「{name}」已退出登录，转发和发送都已暂停。\n点下面的按钮发起登录，然后在手机上确认（或扫描发来的二维码）。",
+                    with_button=True,
+                )
+            elif state == "online" and previous == "login_required":
+                self._post_login_notice(account_id, f"✅ 微信「{name}」已重新登录。")
+        except Exception as exc:  # an alert must never block the event stream
+            self.logger.warning("Login notice for %s failed: %s", account_id, exc)
+
+    def _login_status_chat(self, account_id: str) -> Chat:
+        name = self.chat_mgr.account_name(account_id)
+        return self.chat_mgr.build_core_chat(
+            {
+                "account_id": account_id,
+                "chat_id": self._STATUS_CHAT_ID,
+                "type": "system",
+                "display_name": f"{name} · 登录状态",
+            }
+        )
+
+    def _post_login_notice(
+        self,
+        account_id: str,
+        text: str,
+        *,
+        with_button: bool = False,
+        image: Optional[bytes] = None,
+    ) -> None:
+        chat = self._login_status_chat(account_id)
+        try:
+            author = chat.get_member(SystemChatMember.SYSTEM_ID)
+        except KeyError:
+            author = chat.add_system_member()
+        msg = Message(
+            uid=MessageID(f"login-{uuid.uuid4().hex}"),
+            type=MsgType.Text,
+            text=text,
+            chat=chat,
+            author=author,
+        )
+        if with_button:
+            msg.commands = MessageCommands(
+                [MessageCommand(name="发起登录", callable_name="start_wechat_login", args=(account_id,))]
+            )
+        if image is not None:
+            handle = tempfile.NamedTemporaryFile(prefix="wechat-login-", suffix=".png")
+            handle.write(image)
+            handle.flush()
+            handle.seek(0)
+            msg.type = MsgType.Image
+            msg.file = handle
+            msg.path = Path(handle.name)
+            msg.filename = "login-qr.png"
+            msg.mime = "image/png"
+        self._deliver_message(msg)
+
+    def start_wechat_login(self, account_id: str) -> str:
+        """Button callback (ETM message command): start the login flow."""
+        try:
+            result = self.core.start_login(account_id)
+        except CoreError as exc:
+            self.logger.warning("Starting login for %s failed: %s", account_id, exc)
+            return f"发起登录失败：{exc}"
+        state = str(result.get("login_flow_state") or "")
+        if state == "logged_in":
+            return "这个号已经是登录状态了。"
+        with self._login_lock:
+            running = self._login_watchers.get(account_id)
+            if running is None or not running.is_alive():
+                watcher = threading.Thread(
+                    target=self._watch_login,
+                    args=(account_id,),
+                    name=f"login-watch-{account_id}",
+                    daemon=True,
+                )
+                self._login_watchers[account_id] = watcher
+                watcher.start()
+        return "已发起登录，请在手机微信上确认；需要扫码的话会发来二维码。"
+
+    def _watch_login(self, account_id: str) -> None:
+        """Follow the login flow: send the QR code if one is needed, report a timeout."""
+        deadline = time.time() + self.login_watch_sec
+        qr_sent = False
+        while time.time() < deadline and not self._stop_event.is_set():
+            try:
+                status = self.core.login_status(account_id)
+            except CoreError as exc:
+                self.logger.info("Login status for %s unavailable: %s", account_id, exc)
+                status = {}
+            if str(status.get("auth_status") or "") == "logged_in" or status.get("state") == "online":
+                return  # the account.status event posts the success note
+            flow = str(status.get("login_flow_state") or "")
+            if flow in {"error", "timeout"}:
+                break
+            if not qr_sent and status.get("snapshot_available") and flow == "waiting_for_scan":
+                try:
+                    png = self.core.login_snapshot(account_id)
+                except CoreError as exc:
+                    self.logger.info("Login QR for %s not ready: %s", account_id, exc)
+                else:
+                    self._post_login_notice(account_id, "请用手机微信扫描这个二维码登录。", image=png)
+                    qr_sent = True
+            self._stop_event.wait(3.0)
+        if self._stop_event.is_set():
+            return
+        with self._login_lock:
+            still_out = self._account_login_state.get(account_id) == "login_required"
+        if still_out:
+            try:
+                self._post_login_notice(
+                    account_id, "登录还没有完成，可以再点一次按钮重试。", with_button=True
+                )
+            except Exception as exc:
+                self.logger.warning("Login retry notice for %s failed: %s", account_id, exc)
+
     def _deliver_message(self, msg: Message) -> None:
         if getattr(coordinator, "master", None) is None:
             raise CoreUnavailableError("EFB master is not ready; event cursor will not advance")
@@ -1433,6 +1578,7 @@ class LinuxWeChatChannel(SlaveChannel):
             self._retry_deferred_provenance()
         elif event_type == "account.status":
             self.logger.info("Core event %s for %s: %r", event_type, account_id, payload)
+            self._handle_account_status(account_id, payload)
         else:
             # Contract explicitly requires future unknown event types to be tolerated.
             self.logger.warning("Ignoring unknown Core event type %r", event_type)
