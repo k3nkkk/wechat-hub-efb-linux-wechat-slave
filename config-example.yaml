@@ -13,7 +13,9 @@ event_limit: 50
 startup_healthcheck: true
 
 # React on messages you send from Telegram once Core reports the outcome.
-# Per-kind switches; an empty emoji disables that outcome.
+# Per kind: true = every outcome, problems = only uncertain/failed
+# (cleared again on a late success), false = off. An empty emoji disables
+# that outcome.
 send_reactions:
   text: false
   image: false

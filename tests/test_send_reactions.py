@@ -74,6 +74,31 @@ class SendReactionsTest(unittest.TestCase):
             self.reactions,
         )
 
+    def test_problems_mode_marks_only_uncertain_and_failed(self) -> None:
+        channel = self._channel(text="problems", image=True)
+        self.assertEqual({"text": "problems", "image": "all"}, channel.send_reaction_modes)
+        self.targets.update({"ok": ("-1", 1), "slow": ("-1", 2), "bad": ("-1", 3), "img": ("-1", 4)})
+        self._update("ok", "text", "sent")  # success stays quiet
+        self._update("slow", "text", "uncertain")
+        self._update("bad", "text", "failed")
+        self._update("img", "image", "sent")
+        self.assertEqual(
+            [("-1", 2, "🤔"), ("-1", 3, "👎"), ("-1", 4, "👌")],
+            self.reactions,
+        )
+
+    def test_problems_mode_clears_the_mark_after_a_late_success(self) -> None:
+        self._channel(text="problems")
+        self.targets["late"] = ("-1", 7)
+        self._update("late", "text", "uncertain")
+        self._update("late", "text", "sent")
+        self._update("late", "text", "sent")  # cleared once only
+        self.assertEqual([("-1", 7, "🤔"), ("-1", 7, "")], self.reactions)
+
+    def test_string_off_disables_kind(self) -> None:
+        channel = self._channel(text="off", file="false")
+        self.assertEqual(set(), channel.send_reaction_kinds)
+
     def test_custom_and_empty_emoji(self) -> None:
         self._channel(text=True, sent="👍", uncertain="")
         self.targets.update({"a": ("-1", 1), "b": ("-1", 2)})

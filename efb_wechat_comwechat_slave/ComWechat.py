@@ -95,8 +95,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # many seconds so the echo is recognised instead of delivered twice.
     "send_echo_wait_sec": 20.0,
     # React on the Telegram message once Core reports the outcome of a send
-    # made from Telegram. Per-kind switches; an empty emoji disables that
-    # outcome. Only Telegram's standard reaction emoji are accepted.
+    # made from Telegram. Per kind: true reacts to every outcome, "problems"
+    # only to uncertain/failed sends (a later success clears the mark), false
+    # disables it. An empty emoji disables that outcome. Only Telegram's
+    # standard reaction emoji are accepted.
     "send_reactions": {
         "text": False,
         "image": False,
@@ -188,9 +190,17 @@ class LinuxWeChatChannel(SlaveChannel):
         reactions = dict(DEFAULT_CONFIG["send_reactions"])
         if isinstance(self.config.get("send_reactions"), Mapping):
             reactions.update(self.config["send_reactions"])
-        self.send_reaction_kinds = {
-            kind for kind in ("text", "image", "file") if bool(reactions.get(kind))
-        }
+        self.send_reaction_modes: Dict[str, str] = {}
+        for kind in ("text", "image", "file"):
+            mode = reactions.get(kind)
+            if isinstance(mode, str) and mode.strip().lower() in {"problems", "failures", "problem", "failure"}:
+                self.send_reaction_modes[kind] = "problems"
+            elif isinstance(mode, str) and mode.strip().lower() in {"", "false", "off", "no", "none"}:
+                continue
+            elif mode:
+                self.send_reaction_modes[kind] = "all"
+        self.send_reaction_kinds = set(self.send_reaction_modes)
+        self._problem_marked: Dict[str, float] = {}
         self.send_reaction_emoji = {
             status: str(reactions.get(status) or "").strip()
             for status in ("sent", "uncertain", "failed")
@@ -1123,8 +1133,26 @@ class LinuxWeChatChannel(SlaveChannel):
         kind = str(receipt.get("kind") or "")
         status = str(receipt.get("status") or "")
         send_id = str(receipt.get("send_id") or "")
+        mode = self.send_reaction_modes.get(kind)
+        if not send_id or mode is None:
+            return
         emoji = self.send_reaction_emoji.get(status, "")
-        if not send_id or not emoji or kind not in self.send_reaction_kinds:
+        if mode == "problems":
+            if status == "sent":
+                # Only clear a problem mark shown earlier; success stays quiet.
+                with self._reaction_lock:
+                    if self._problem_marked.pop(send_id, None) is None:
+                        return
+                emoji = ""
+            elif status in {"uncertain", "failed"} and emoji:
+                with self._reaction_lock:
+                    self._problem_marked[send_id] = time.time()
+                    cutoff = time.time() - 86400
+                    for old in [k for k, t in self._problem_marked.items() if t < cutoff]:
+                        self._problem_marked.pop(old, None)
+            else:
+                return
+        elif not emoji:
             return
         with self._reaction_lock:
             self._pending_reactions[send_id] = {"emoji": emoji, "attempts": 0, "due": 0.0}
@@ -1193,7 +1221,7 @@ class LinuxWeChatChannel(SlaveChannel):
                 {
                     "chat_id": chat_id,
                     "message_id": message_id,
-                    "reaction": [{"type": "emoji", "emoji": emoji}],
+                    "reaction": [{"type": "emoji", "emoji": emoji}] if emoji else [],
                 },
             )
         except Exception as exc:  # reactions are cosmetic; never break polling
