@@ -64,6 +64,22 @@ class ReplyQuoteTest(unittest.TestCase):
         self.assertEqual("1", msg.text)
         self.assertEqual("m0", str(msg.target.uid))
 
+    def test_undelivered_target_keeps_inline_quote(self) -> None:
+        self.builder.target_delivered = lambda message_id: message_id == "m_seen"
+        msg = self._reply("1", "原文", target_message_id="m_missing")
+        self.assertEqual(f"「小王: 原文」\n{SEP}\n1", msg.text)
+        msg = self._reply("1", "原文", target_message_id="m_seen")
+        self.assertEqual("1", msg.text)
+        self.assertEqual("m_seen", str(msg.target.uid))
+
+    def test_failing_delivery_check_keeps_inline_quote(self) -> None:
+        def boom(_message_id: str) -> bool:
+            raise RuntimeError("db closed")
+
+        self.builder.target_delivered = boom
+        msg = self._reply("1", "原文", target_message_id="m0")
+        self.assertTrue(msg.text.startswith("「小王: 原文」"))
+
     def test_mentions_are_shifted_past_the_quote(self) -> None:
         msg = self._reply(
             "@B 好",

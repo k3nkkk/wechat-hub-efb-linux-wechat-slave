@@ -10,7 +10,7 @@ import mimetypes
 import tempfile
 from pathlib import Path
 import re
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from ehforwarderbot import Message, MsgType
 from ehforwarderbot.chat import Chat, GroupChat
@@ -71,9 +71,27 @@ def _is_transient_media_error(exc: CoreAPIError) -> bool:
 
 
 class CoreMessageBuilder:
-    def __init__(self, core: CoreClient, chats: ChatMgr) -> None:
+    def __init__(
+        self,
+        core: CoreClient,
+        chats: ChatMgr,
+        target_delivered: Optional[Callable[[str], bool]] = None,
+    ) -> None:
         self.core = core
         self.chats = chats
+        # Whether a Core message was delivered to the master channel, so a
+        # native reply to it can be rendered. None means "assume it was".
+        self.target_delivered = target_delivered
+
+    def _reply_target_visible(self, target_message_id: str) -> bool:
+        if not target_message_id:
+            return False
+        if self.target_delivered is None:
+            return True
+        try:
+            return bool(self.target_delivered(target_message_id))
+        except Exception:
+            return False
 
     def _media_file(
         self,
@@ -316,7 +334,9 @@ class CoreMessageBuilder:
             efb_msg.type = MsgType.Text
             if efb_msg.text.startswith("[Link] "):
                 efb_msg.text = efb_msg.text[len("[Link] "):]
-            if not str(message.get("target_message_id") or ""):
+            # A native reply shows the quoted message itself; the inline quote
+            # is only needed when there is no delivered message to reply to.
+            if not self._reply_target_visible(str(message.get("target_message_id") or "")):
                 reply_prefix = self._quote_prefix(message)
             efb_msg.text = efb_msg.text or "[引用]"
         elif msg_type in {"contact_card", "system"}:

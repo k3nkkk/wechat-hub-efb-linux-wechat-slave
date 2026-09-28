@@ -150,7 +150,9 @@ class LinuxWeChatChannel(SlaveChannel):
         self.consumer_id = f"{consumer_base}:{self.channel_id}"
 
         self.chat_mgr = ChatMgr(self)
-        self.message_builder = CoreMessageBuilder(self.core, self.chat_mgr)
+        self.message_builder = CoreMessageBuilder(
+            self.core, self.chat_mgr, target_delivered=self._delivered_to_master
+        )
         self._stop_event = threading.Event()
         # Retry3 shutdown coordination state.
         self._shutdown_in_progress = threading.Event()
@@ -786,6 +788,23 @@ class LinuxWeChatChannel(SlaveChannel):
         if target_message_id:
             payload["target_message_id"] = target_message_id
         return payload, request_id, quote_fallback
+
+    def _delivered_to_master(self, core_message_id: str) -> bool:
+        """Whether the Telegram master logged a message for ``core_message_id``.
+
+        Messages sent from Telegram are logged under their send UID, so the
+        Core echo id is translated first. Without a logged message the master
+        cannot render a native reply to it.
+        """
+        try:
+            from efb_telegram_master.db import MsgLog  # type: ignore
+        except Exception:
+            return True  # unknown master: keep the native reply
+        uid = self.echo_store.efb_message_id(str(core_message_id))
+        try:
+            return MsgLog.select().where(MsgLog.slave_message_id == uid).exists()
+        except Exception:
+            return True
 
     def send_message(self, msg: Message) -> Message:
         if msg.edit:
