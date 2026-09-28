@@ -9,6 +9,7 @@ from __future__ import annotations
 import mimetypes
 import tempfile
 from pathlib import Path
+import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ehforwarderbot import Message, MsgType
@@ -123,6 +124,46 @@ class CoreMessageBuilder:
         handle.seek(0)
         return handle, final_name, final_mime, Path(handle.name)
 
+    _QUOTE_SEPARATOR = "- - - - - - - - - - - - - - -"
+    _QUOTE_MAX_LEN = 80
+    _QUOTED_XML_KINDS = (
+        ("<img", "[图片]"),
+        ("<videomsg", "[视频]"),
+        ("<voicemsg", "[语音]"),
+        ("<emoji", "[表情]"),
+        ("<location", "[位置]"),
+    )
+
+    @classmethod
+    def _quoted_summary(cls, content: str) -> str:
+        """One-line summary of the quoted message (its content may be XML)."""
+        text = str(content or "").strip()
+        if text.startswith("<"):
+            lowered = text.lower()
+            for marker, label in cls._QUOTED_XML_KINDS:
+                if marker in lowered:
+                    return label
+            title = re.search(r"<title>(.*?)</title>", text, re.S)
+            if title and title.group(1).strip():
+                text = title.group(1)
+            else:
+                text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > cls._QUOTE_MAX_LEN:
+            text = text[: cls._QUOTE_MAX_LEN - 1] + "…"
+        return text or "[消息]"
+
+    @classmethod
+    def _quote_prefix(cls, message: Mapping[str, Any]) -> str:
+        attrs = message.get("attributes") if isinstance(message.get("attributes"), Mapping) else {}
+        reply = attrs.get("reply") if isinstance(attrs.get("reply"), Mapping) else {}
+        if not reply:
+            return ""
+        sender = str(reply.get("sender") or "").strip()
+        summary = cls._quoted_summary(str(reply.get("content") or ""))
+        quoted = f"{sender}: {summary}" if sender else summary
+        return f"「{quoted}」\n{cls._QUOTE_SEPARATOR}\n"
+
     def _substitutions(self, message: Mapping[str, Any], chat: Chat, account_id: str) -> Optional[Substitutions]:
         raw = message.get("substitutions")
         if not isinstance(raw, list):
@@ -222,6 +263,7 @@ class CoreMessageBuilder:
                 "message": dict(message.get("vendor_specific") or {}),
             }
         }
+        reply_prefix = ""
         efb_msg = Message(
             chat=chat,
             author=author,
@@ -268,6 +310,15 @@ class CoreMessageBuilder:
             else:
                 efb_msg.type = MsgType.Location
                 efb_msg.attributes = LocationAttribute(latitude=latitude, longitude=longitude)
+        elif msg_type == "reply":
+            # A WeChat quote reply. Without a resolvable target message the
+            # quoted content is shown inline so the context is not lost.
+            efb_msg.type = MsgType.Text
+            if efb_msg.text.startswith("[Link] "):
+                efb_msg.text = efb_msg.text[len("[Link] "):]
+            if not str(message.get("target_message_id") or ""):
+                reply_prefix = self._quote_prefix(message)
+            efb_msg.text = efb_msg.text or "[引用]"
         elif msg_type in {"contact_card", "system"}:
             efb_msg.type = MsgType.Text
             efb_msg.text = efb_msg.text or f"[{msg_type.replace('_', ' ')}]"
@@ -305,6 +356,13 @@ class CoreMessageBuilder:
             efb_msg.path = path
 
         substitutions = self._substitutions(message, chat, account_id)
+        if reply_prefix:
+            efb_msg.text = reply_prefix + efb_msg.text
+            if substitutions:
+                shift = len(reply_prefix)
+                substitutions = Substitutions(
+                    {(start + shift, end + shift): value for (start, end), value in substitutions.items()}
+                )
         if substitutions:
             efb_msg.substitutions = substitutions
 
