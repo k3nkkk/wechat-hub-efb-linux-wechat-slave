@@ -233,8 +233,8 @@ class LocationAttribute:
         self.title = title
 
 
-class Substitutions:
-    pass
+class Substitutions(dict):
+    """Like EFB's Substitutions: a mapping of (start, end) -> chat/member."""
 
 
 def extra(name: str = "", desc: str = ""):
