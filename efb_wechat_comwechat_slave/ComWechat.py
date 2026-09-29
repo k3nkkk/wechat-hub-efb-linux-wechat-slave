@@ -86,6 +86,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "consumer_id": "efb-linux-wechat",
     "account_ids": [],
     "poll_interval": 1.0,
+    # Core's /health refreshes every account's live Runtime status, which makes each
+    # agent-wechat walk WeChat's whole accessibility tree and take a screenshot. The
+    # poll loop only needs it to notice capability changes, so it is refreshed at most
+    # once per this many seconds (0 = every poll, the old behaviour).
+    "health_interval_sec": 60.0,
     "event_limit": 50,
     "startup_healthcheck": True,
     "bootstrap_mode": "at_head",
@@ -177,6 +182,8 @@ class LinuxWeChatChannel(SlaveChannel):
         self.poll_timeout = max(0, min(int(core_cfg.get("poll_timeout", 15)), 30))
         self.event_limit = max(1, min(int(self.config.get("event_limit", 50)), 200))
         self.poll_interval = max(0.05, float(self.config.get("poll_interval", 1.0)))
+        self.health_interval_sec = max(0.0, float(self.config.get("health_interval_sec", 60.0)))
+        self._last_health_ok = 0.0
         self.account_filter: Set[str] = {
             str(item) for item in self.config.get("account_ids", []) if str(item)
         }
@@ -628,6 +635,14 @@ class LinuxWeChatChannel(SlaveChannel):
             )
             attempted += 1
         return attempted
+
+    def _health_throttled(self) -> None:
+        """Refresh Core health at most once per ``health_interval_sec``."""
+        now = time.time()
+        if self.health_interval_sec > 0 and now - self._last_health_ok < self.health_interval_sec:
+            return
+        self._health()
+        self._last_health_ok = now
 
     def _health(self) -> Dict[str, Any]:
         payload = self.core.health()
@@ -2060,7 +2075,7 @@ class LinuxWeChatChannel(SlaveChannel):
 
     def poll_once(self, poll_timeout: Optional[int] = None) -> int:
         """Process one Core event page. Exposed for deterministic integration tests."""
-        self._health()
+        self._health_throttled()
         if not self.subscription_floor.scoped_accounts():
             # Core may have been unreachable at construction time; without a durable
             # floor every unknown identity fails closed, so keep trying to establish it.
