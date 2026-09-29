@@ -30,3 +30,6 @@ send_reactions:
   sent: "👌"
   uncertain: "🤔"
   failed: "👎"
+# When an account needs to log in again, post a message with a button that
+# starts the login flow (confirm on the phone, or scan the QR code sent).
+login_alert: true

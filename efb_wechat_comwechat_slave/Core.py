@@ -128,6 +128,24 @@ class CoreClient:
             raise CoreUnavailableError("Core /v1/accounts response has no accounts list")
         return [item for item in accounts if isinstance(item, dict)]
 
+    def start_login(self, account_id: str) -> Dict[str, Any]:
+        """Ask Core/Runtime to start the WeChat login flow for an account."""
+        path = f"/v1/runtime/accounts/{quote(str(account_id), safe='')}/login"
+        return self._json(self._request("POST", path, json={}))
+
+    def login_status(self, account_id: str) -> Dict[str, Any]:
+        path = f"/v1/runtime/accounts/{quote(str(account_id), safe='')}/login"
+        return self._json(self._request("GET", path))
+
+    def login_snapshot(self, account_id: str) -> bytes:
+        """PNG of the login QR code; raises CoreAPIError(409) while not ready."""
+        path = f"/v1/runtime/accounts/{quote(str(account_id), safe='')}/login/snapshot"
+        response = self._request("GET", path)
+        content = response.content
+        if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise CoreUnavailableError("Core login snapshot is not a PNG")
+        return content
+
     def list_chats(self, account_id: str, *, query: str = "", limit: int = 200) -> List[Dict[str, Any]]:
         """Return all pages for one account without assuming cursor syntax."""
         rows: List[Dict[str, Any]] = []

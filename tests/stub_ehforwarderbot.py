@@ -143,6 +143,18 @@ class Message:
         self.vendor_specific: Dict[str, Any] = vendor_specific or {}
 
 
+class MessageCommand:
+    def __init__(self, name: str, callable_name: str, args: Any = None, kwargs: Any = None):
+        self.name = name
+        self.callable_name = callable_name
+        self.args = tuple(args or ())
+        self.kwargs = dict(kwargs or {})
+
+
+class MessageCommands(list):
+    pass
+
+
 class Status:
     pass
 
@@ -295,6 +307,8 @@ def install_stubs():
     mod_msg.LinkAttribute = LinkAttribute
     mod_msg.LocationAttribute = LocationAttribute
     mod_msg.Substitutions = Substitutions
+    mod_msg.MessageCommand = MessageCommand
+    mod_msg.MessageCommands = MessageCommands
     mod_efb.message = mod_msg
 
     mod_utils = types.ModuleType("ehforwarderbot.utils")
