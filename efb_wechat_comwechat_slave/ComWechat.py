@@ -100,6 +100,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "delivery_mode": "fast",
     "ordered_scope": "all",
     "ordered_max_wait_sec": 20.0,
+    # A send from Telegram can reach WeChat (and come back from Core as an
+    # outgoing message) before Core has linked it to the send. Outgoing
+    # messages in a chat with an unconfirmed send are held for up to this
+    # many seconds so the echo is recognised instead of delivered twice.
+    "send_echo_wait_sec": 20.0,
+    # React on the Telegram message once Core reports the outcome of a send
+    # made from Telegram. Per kind: true reacts to every outcome, "problems"
+    # only to uncertain/failed sends (a later success clears the mark), false
+    # disables it. An empty emoji disables that outcome. Only Telegram's
+    # standard reaction emoji are accepted.
+    "send_reactions": {
+        "text": False,
+        "image": False,
+        "file": False,
+        "sent": "👌",
+        "uncertain": "🤔",
+        "failed": "👎",
+    },
     # Retry3 graceful-shutdown coordination (defect R14-EFB-D3 / Exit 137).
     "shutdown_master_budget_sec": 1.0,
     "shutdown_slave_drain_budget_sec": 0.75,
@@ -191,6 +209,28 @@ class LinuxWeChatChannel(SlaveChannel):
             ordered_scope = "all"
         self.ordered_scope = ordered_scope
         self.ordered_max_wait_sec = max(0.0, float(self.config.get("ordered_max_wait_sec", 20.0)))
+        reactions = dict(DEFAULT_CONFIG["send_reactions"])
+        if isinstance(self.config.get("send_reactions"), Mapping):
+            reactions.update(self.config["send_reactions"])
+        self.send_reaction_modes: Dict[str, str] = {}
+        for kind in ("text", "image", "file"):
+            mode = reactions.get(kind)
+            if isinstance(mode, str) and mode.strip().lower() in {"problems", "failures", "problem", "failure"}:
+                self.send_reaction_modes[kind] = "problems"
+            elif isinstance(mode, str) and mode.strip().lower() in {"", "false", "off", "no", "none"}:
+                continue
+            elif mode:
+                self.send_reaction_modes[kind] = "all"
+        self.send_reaction_kinds = set(self.send_reaction_modes)
+        self._problem_marked: Dict[str, float] = {}
+        self.send_reaction_emoji = {
+            status: str(reactions.get(status) or "").strip()
+            for status in ("sent", "uncertain", "failed")
+        }
+        self._pending_reactions: Dict[str, Dict[str, Any]] = {}
+        self.send_echo_wait_sec = max(0.0, float(self.config.get("send_echo_wait_sec", 20.0)))
+        self._inflight_sends: Dict[str, Tuple[str, str, float]] = {}
+        self._reaction_lock = threading.Lock()
 
         resolved_data_path = Path(data_path) if data_path is not None else efb_utils.get_data_path(self.channel_id)
         self.cursor_store = CursorStore(resolved_data_path / "core-event-cursor.json")
@@ -897,6 +937,8 @@ class LinuxWeChatChannel(SlaveChannel):
                 self.echo_store.link(send_id, echo_message_id)
             else:
                 self.echo_store.mark_pending(send_id, request_id)
+                with self._reaction_lock:
+                    self._inflight_sends[send_id] = (account_id, chat_id, time.time())
         telegram_chat_id, telegram_message_id = self._telegram_message_ids(msg)
         self.message_mapping.record(
             self.consumer_id,
@@ -1029,6 +1071,183 @@ class LinuxWeChatChannel(SlaveChannel):
                 str(error.get("message") or "upstream response was not received"),
                 dict(details),
             )
+        if send_id and (echo_message_id or status in {"sent", "failed", "uncertain"}):
+            with self._reaction_lock:
+                self._inflight_sends.pop(send_id, None)
+        self._queue_send_reaction(receipt)
+
+    # -- send echo hold ---------------------------------------------------------
+
+    def _awaiting_send_echo(self, account_id: str, chat_id: str) -> bool:
+        """Is a send from Telegram to this chat still waiting for its echo link?"""
+        if not self._inflight_sends:
+            return False
+        now = time.time()
+        with self._reaction_lock:
+            for send_id, (acc, chat, started) in list(self._inflight_sends.items()):
+                if now - started > self.send_echo_wait_sec:
+                    self._inflight_sends.pop(send_id, None)
+                elif acc == account_id and chat == chat_id:
+                    return True
+        return False
+
+    def _hold_pending(
+        self,
+        account_id: str,
+        message: Mapping[str, Any],
+        event_type: str,
+        effect_id: str,
+        reason: str,
+    ) -> None:
+        """Park a message durably; the pending-media retry path re-evaluates it."""
+        now = time.time()
+        current = self.effect_ledger.get_effect(self.consumer_id, effect_id)
+        details = current.get("details", {}) if current else {}
+        try:
+            attempt_count = int(details.get("attempt_count") or 1)
+        except (TypeError, ValueError):
+            attempt_count = 1
+        try:
+            deadline_at = float(details.get("deadline_at"))
+        except (TypeError, ValueError):
+            deadline_at = now + self.media_retry_deadline_sec
+        self.effect_ledger.mark_media_pending(
+            self.consumer_id,
+            effect_id,
+            account_id=account_id,
+            message_id=str(message.get("message_id") or ""),
+            event_type=event_type,
+            message=message,
+            media_id=str(message.get("media_id") or ""),
+            attempt_count=attempt_count,
+            next_retry_at=now,
+            deadline_at=deadline_at,
+            last_error=reason,
+        )
+        self.logger.info("Holding effect %s: %s", effect_id, reason)
+
+    def _close_held_echo(
+        self,
+        account_id: str,
+        core_message_id: str,
+        efb_message_id: str,
+        event_type: str,
+    ) -> None:
+        """A held message turned out to be the echo of our own send: close it."""
+        effect_id = self.effect_ledger.compute_effect_id(account_id, core_message_id)
+        if self.effect_ledger.get_effect_status(self.consumer_id, effect_id) != STATE_PENDING_MEDIA:
+            return
+        self.effect_ledger.mark_delivered(
+            self.consumer_id,
+            effect_id,
+            efb_uid=efb_message_id,
+            event_type=event_type,
+            details={"suppressed_send_echo": True},
+        )
+
+    # -- send outcome reactions ------------------------------------------------
+
+    _REACTION_RETRY_SEC = 3.0
+    _REACTION_MAX_ATTEMPTS = 10
+
+    def _queue_send_reaction(self, receipt: Mapping[str, Any]) -> None:
+        """Remember a reaction for the Telegram message behind a Core send."""
+        kind = str(receipt.get("kind") or "")
+        status = str(receipt.get("status") or "")
+        send_id = str(receipt.get("send_id") or "")
+        mode = self.send_reaction_modes.get(kind)
+        if not send_id or mode is None:
+            return
+        emoji = self.send_reaction_emoji.get(status, "")
+        if mode == "problems":
+            if status == "sent":
+                # Only clear a problem mark shown earlier; success stays quiet.
+                with self._reaction_lock:
+                    if self._problem_marked.pop(send_id, None) is None:
+                        return
+                emoji = ""
+            elif status in {"uncertain", "failed"} and emoji:
+                with self._reaction_lock:
+                    self._problem_marked[send_id] = time.time()
+                    cutoff = time.time() - 86400
+                    for old in [k for k, t in self._problem_marked.items() if t < cutoff]:
+                        self._problem_marked.pop(old, None)
+            else:
+                return
+        elif not emoji:
+            return
+        with self._reaction_lock:
+            self._pending_reactions[send_id] = {"emoji": emoji, "attempts": 0, "due": 0.0}
+        self._flush_send_reactions()
+
+    def _flush_send_reactions(self) -> None:
+        if not self._pending_reactions:
+            return
+        now = time.time()
+        with self._reaction_lock:
+            due = [(sid, dict(item)) for sid, item in self._pending_reactions.items() if item["due"] <= now]
+        for send_id, item in due:
+            target = self._telegram_target(send_id)
+            if target is None:
+                attempts = item["attempts"] + 1
+                with self._reaction_lock:
+                    if attempts >= self._REACTION_MAX_ATTEMPTS:
+                        self._pending_reactions.pop(send_id, None)
+                        self.logger.info("No Telegram message found for send %s; reaction dropped", send_id)
+                    elif send_id in self._pending_reactions:
+                        self._pending_reactions[send_id].update(
+                            attempts=attempts, due=now + self._REACTION_RETRY_SEC
+                        )
+                continue
+            with self._reaction_lock:
+                if self._pending_reactions.get(send_id, {}).get("emoji") == item["emoji"]:
+                    self._pending_reactions.pop(send_id, None)
+            self._set_telegram_reaction(target[0], target[1], item["emoji"])
+
+    @staticmethod
+    def _telegram_target(send_id: str) -> Optional[Tuple[str, int]]:
+        """Telegram chat/message of the message that produced ``send_id``.
+
+        The Telegram master logs the slave UID it got back from
+        ``send_message`` (the Core send_id) next to the Telegram message ID.
+        """
+        try:
+            from efb_telegram_master.db import MsgLog  # type: ignore
+        except Exception:
+            return None
+        try:
+            row = (
+                MsgLog.select()
+                .where(MsgLog.slave_message_id == send_id)
+                .order_by(MsgLog.time.desc())
+                .first()
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        chat_id, _, message_id = str(row.master_msg_id).rpartition(".")
+        try:
+            return chat_id, int(message_id)
+        except ValueError:
+            return None
+
+    def _set_telegram_reaction(self, chat_id: str, message_id: int, emoji: str) -> None:
+        master = getattr(coordinator, "master", None)
+        bot = getattr(getattr(master, "bot_manager", None), "_bot", None)
+        if bot is None:
+            return
+        try:
+            bot._post(
+                "setMessageReaction",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reaction": [{"type": "emoji", "emoji": emoji}] if emoji else [],
+                },
+            )
+        except Exception as exc:  # reactions are cosmetic; never break polling
+            self.logger.warning("Telegram reaction %s on %s/%s failed: %s", emoji, chat_id, message_id, exc)
 
     @staticmethod
     def _is_media_message(message: Mapping[str, Any]) -> bool:
@@ -1170,6 +1389,7 @@ class LinuxWeChatChannel(SlaveChannel):
                 core_message_id,
                 efb_message_id,
             )
+            self._close_held_echo(account_id, core_message_id, efb_message_id, event_type)
             return
 
         is_media = self._is_media_message(message)
@@ -1253,6 +1473,13 @@ class LinuxWeChatChannel(SlaveChannel):
             )
             return
 
+        if (
+            effect_id
+            and str(message.get("direction") or "") == "outgoing"
+            and self._awaiting_send_echo(account_id, chat_id)
+        ):
+            self._hold_pending(account_id, message, event_type, effect_id, "waiting for send echo")
+            return
         if effect_id and self.delivery_mode == "ordered" and current_status == STATE_PENDING_MEDIA:
             message = self._with_first_cursor(effect_id, message)
         if effect_id and self._ordered_blocked(account_id, chat_id, message, effect_id):
@@ -1626,6 +1853,7 @@ class LinuxWeChatChannel(SlaveChannel):
             self._ensure_subscription_floor()
         self._retry_pending_media()
         self._retry_deferred_provenance()
+        self._flush_send_reactions()
         cursor = self.cursor_store.load(default=None)
         if cursor is None:
             cursor = self._ensure_bootstrap_aligned()

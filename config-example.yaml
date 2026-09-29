@@ -19,3 +19,14 @@ startup_healthcheck: true
 delivery_mode: fast
 ordered_scope: all
 ordered_max_wait_sec: 20
+# React on messages you send from Telegram once Core reports the outcome.
+# Per kind: true = every outcome, problems = only uncertain/failed
+# (cleared again on a late success), false = off. An empty emoji disables
+# that outcome.
+send_reactions:
+  text: false
+  image: false
+  file: false
+  sent: "👌"
+  uncertain: "🤔"
+  failed: "👎"
