@@ -40,6 +40,7 @@ from ehforwarderbot.types import ChatID, InstanceID, MessageID
 from . import __version__ as version
 from .ChatMgr import ChatMgr
 from .Core import CoreAPIError, CoreClient, CoreContractError, CoreError, CoreUnavailableError, CursorStore, EchoStore
+from .SendRecovery import SendRecovery, kind_for_type_name
 from .CoreMessage import CoreMessageBuilder, MediaPendingError, MediaPermanentError
 from .EffectLedger import (
     BLOCKED_UNCERTAIN_EFFECT,
@@ -194,6 +195,13 @@ class LinuxWeChatChannel(SlaveChannel):
         self._login_lock = threading.Lock()
         self._account_login_state: Dict[str, str] = {}
         self._login_watchers: Dict[str, threading.Thread] = {}
+        self.send_recovery = SendRecovery(
+            send=self._core_send,
+            post_notice=self._post_recovery_notice,
+            chat_label=self._chat_label,
+            stop_event=self._stop_event,
+            config=self.config.get("send_recovery"),
+        )
         # Retry3 shutdown coordination state.
         self._shutdown_in_progress = threading.Event()
         self._checkpoint_flush_lock = threading.Lock()
@@ -947,12 +955,17 @@ class LinuxWeChatChannel(SlaveChannel):
             else:
                 raise EFBMessageTypeNotSupported(f"Unsupported outgoing EFB message type: {msg.type}")
         except CoreAPIError as exc:
+            if self.send_recovery.queue_rejected(
+                exc, kind_for_type_name(str(msg.type)), payload, request_id, account_id, chat_id
+            ):
+                raise EFBMessageError("微信正在重新登录，这条消息已排队，恢复后会自动补发。") from exc
             raise EFBMessageError(f"Core rejected message [{exc.code}]: {exc.message}") from exc
         except CoreError as exc:
             raise EFBMessageError(str(exc)) from exc
 
         send_id = str(receipt.get("send_id") or "")
         echo_message_id = str(receipt.get("echo_message_id") or "")
+        self.send_recovery.remember_sent(send_id, kind_for_type_name(str(msg.type)), payload, account_id, chat_id)
         msg.uid = MessageID(echo_message_id or send_id or request_id)
         vendor = dict(msg.vendor_specific or {})
         vendor["core"] = {
@@ -1007,6 +1020,7 @@ class LinuxWeChatChannel(SlaveChannel):
 
     def _handle_account_status(self, account_id: str, payload: Mapping[str, Any]) -> None:
         """Post a login button when an account drops out, and a note when it is back."""
+        self.send_recovery.on_account_status(account_id, payload)
         if not self.login_alert or not account_id:
             return
         account = payload.get("account") if isinstance(payload.get("account"), dict) else payload
@@ -1135,6 +1149,38 @@ class LinuxWeChatChannel(SlaveChannel):
             except Exception as exc:
                 self.logger.warning("Login retry notice for %s failed: %s", account_id, exc)
 
+    # -- send recovery ---------------------------------------------------------------
+
+    def _core_send(self, kind: str, payload: Mapping[str, Any], idempotency_key: str) -> Dict[str, Any]:
+        return getattr(self.core, f"send_{kind}")(payload, idempotency_key)
+
+    def _chat_label(self, account_id: str, chat_id: str) -> str:
+        chat = self.chat_mgr.get_by_core(account_id, chat_id)
+        return str(getattr(chat, "name", "") or chat_id)
+
+    def _post_recovery_notice(self, account_id: str, text: str, *, resend_send_id: Optional[str] = None) -> None:
+        chat = self._login_status_chat(account_id)
+        try:
+            author = chat.get_member(SystemChatMember.SYSTEM_ID)
+        except KeyError:
+            author = chat.add_system_member()
+        msg = Message(
+            uid=MessageID(f"recovery-{uuid.uuid4().hex}"),
+            type=MsgType.Text,
+            text=text,
+            chat=chat,
+            author=author,
+        )
+        if resend_send_id:
+            msg.commands = MessageCommands(
+                [MessageCommand(name="重发", callable_name="resend_uncertain_send", args=(resend_send_id,))]
+            )
+        self._deliver_message(msg)
+
+    def resend_uncertain_send(self, send_id: str) -> str:
+        """Button callback (ETM message command): resend an uncertain send."""
+        return self.send_recovery.resend_uncertain(send_id)
+
     def _deliver_message(self, msg: Message) -> None:
         if getattr(coordinator, "master", None) is None:
             raise CoreUnavailableError("EFB master is not ready; event cursor will not advance")
@@ -1238,6 +1284,9 @@ class LinuxWeChatChannel(SlaveChannel):
         if send_id and (echo_message_id or status in {"sent", "failed", "uncertain"}):
             with self._reaction_lock:
                 self._inflight_sends.pop(send_id, None)
+        self.send_recovery.on_send_update(
+            send_id, status, echo_message_id, str(receipt.get("account_id") or event_account_id or "")
+        )
         self._queue_send_reaction(receipt)
 
     # -- send echo hold ---------------------------------------------------------
